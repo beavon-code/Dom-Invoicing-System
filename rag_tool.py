@@ -1,10 +1,17 @@
-from dotenv import load_dotenv
+
 import os
+import hashlib
+
+from pathlib import Path
+from dotenv import load_dotenv
+
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.documents import Document
+from langchain_core.tools import tool, InjectedToolArg
+from langchain_core.runnables import RunnableConfig
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pathlib import Path
+
+from typing import Annotated
 
 from langchain_community.document_loaders import (
     PyPDFLoader,
@@ -18,29 +25,56 @@ from langchain_community.document_loaders import (
 
 load_dotenv()
 
-Path("Uploads").mkdir(exist_ok=True)
-Path("Chroma_db").mkdir(exist_ok=True)
+
+# ==========================================
+# DIRECTORIES
+# ==========================================
+
+UPLOAD_DIR = Path("Uploads")
+CHROMA_DIR = Path("Chroma_db")
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# Embedding model
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# ==========================================
+# EMBEDDINGS
+# ==========================================
+
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+# ==========================================
+# CHROMA VECTOR DATABASE
+# ==========================================
 
 vectorstore = Chroma(
     collection_name="erp_chatbot_docs",
     embedding_function=embeddings,
-    persist_directory="chroma_db"
+    persist_directory=str(CHROMA_DIR)
 )
 
+
+# ==========================================
+# TEXT SPLITTER
+# ==========================================
+
 splitter = RecursiveCharacterTextSplitter(
-        chunk_size=900,
-        chunk_overlap=150
-    )
+    chunk_size=900,
+    chunk_overlap=150
+)
 
 
-# Load_documents
+# ==========================================
+# DOCUMENT LOADER
+# ==========================================
+
 class DocumentLoader:
 
     def __init__(self):
+
         self.supported_formats = {
             ".pdf": PyPDFLoader,
             ".docx": Docx2txtLoader,
@@ -54,8 +88,6 @@ class DocumentLoader:
 
         path = Path(file_path)
 
-        print(path)
-
         if not path.exists():
             raise FileNotFoundError(
                 f"File not found: {file_path}"
@@ -63,11 +95,7 @@ class DocumentLoader:
 
         extension = path.suffix.lower()
 
-        print(path.suffix)
-
-        loader_class = self.supported_formats.get(
-            extension
-        )
+        loader_class = self.supported_formats.get(extension)
 
         if loader_class is None:
             raise ValueError(
@@ -76,15 +104,11 @@ class DocumentLoader:
 
         loader = loader_class(str(path))
 
-        documents = loader.load()
-
-        return documents
+        return loader.load()
 
     def load_directory(self, directory: str):
 
         directory_path = Path(directory)
-
-        print(directory_path)
 
         if not directory_path.is_dir():
             raise NotADirectoryError(directory)
@@ -107,8 +131,6 @@ class DocumentLoader:
 
                 all_documents.extend(documents)
 
-                print(f"Loaded: {file_path.name}")
-
             except Exception as e:
 
                 print(
@@ -118,36 +140,129 @@ class DocumentLoader:
         return all_documents
 
 
-def add_rag(file_path: str, query: str):
+# ==========================================
+# RAG TOOL
+# ==========================================
+
+@tool
+def add_rag(
+    file_path: str,
+    query: str,
+    config: RunnableConfig
+) -> str:
+    """
+    Load a document, index it into ChromaDB and retrieve
+    relevant information.
+
+    Documents are isolated by LangGraph thread ID.
+
+    Args:
+        file_path: Path to the uploaded document.
+        query: Question or instruction about the document.
+
+    Returns:
+        Relevant document chunks for the current conversation.
+    """
+
+    # ======================================
+    # GET CURRENT THREAD ID
+    # ======================================
+
+    thread_id = (
+        config.get("configurable", {}).get("thread_id")
+    )
+
+    if not thread_id:
+        raise ValueError(
+            "Thread ID is missing from LangGraph configuration."
+        )
+
+    # ======================================
+    # LOAD DOCUMENT
+    # ======================================
+
     loader = DocumentLoader()
 
     documents = loader.load_document(file_path)
 
+    if not documents:
+        return "No content found in the uploaded document."
+
+    # ======================================
+    # SPLIT DOCUMENT
+    # ======================================
+
     chunks = splitter.split_documents(documents)
 
-    vectorstore.add_documents(chunks)
+    if not chunks:
+        return "No document chunks were generated."
 
-    docs = vectorstore.similarity_search(query=query, k=4)    
+    # ======================================
+    # ADD THREAD METADATA
+    # ======================================
+
+    source_path = str(Path(file_path).resolve())
+
+    document_id = hashlib.sha256(
+        f"{thread_id}:{source_path}".encode()
+    ).hexdigest()
+
+    for index, chunk in enumerate(chunks):
+
+        chunk.metadata.update({
+            "thread_id": thread_id,
+            "document_id": document_id,
+            "source": Path(file_path).name,
+            "chunk_index": index
+        })
+
+    # ======================================
+    # INDEX DOCUMENT
+    # ======================================
+
+    chunk_ids = [
+        hashlib.sha256(
+            f"{document_id}:{index}".encode()
+        ).hexdigest()
+        for index in range(len(chunks))
+    ]
+
+    vectorstore.add_documents(
+        documents=chunks,
+        ids=chunk_ids
+    )
+
+    # ======================================
+    # THREAD-SPECIFIC RETRIEVAL
+    # ======================================
+
+    docs = vectorstore.similarity_search(
+        query=query,
+        k=4,
+        filter={
+            "thread_id": thread_id
+        }
+    )
 
     if not docs:
-        return "No relevant documents found"
+        return "No relevant documents found."
+
+    # ======================================
+    # FORMAT RESULTS
+    # ======================================
 
     results = []
 
-    for i, doc in enumerate(docs, start=1):
-        source = doc.metadata.get("source", "uploaded_documents")
-        results.append(
-            f"[Source {i}: {source}]\n{doc.page_content}"
+    for index, doc in enumerate(docs, start=1):
+
+        source = doc.metadata.get(
+            "source",
+            "uploaded_documents"
         )
 
-    return "\n\n".join(results)  
+        results.append(
+            f"[Source {index}: {source}]\n"
+            f"{doc.page_content}"
+        )
 
-
-
-
-    
-
-
-
-    
-
+    return "\n\n".join(results)

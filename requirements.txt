@@ -27,3 +27,5 @@ docx2txt==0.9
 langchain-text-splitters==1.1.2
 langgraph-checkpoint-sqlite==3.1.0
 unstructured
+python-multipart
+aiosqlite
